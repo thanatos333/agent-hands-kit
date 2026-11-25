@@ -10,7 +10,9 @@
 
 *An AI agent modelling a hinge in a CAD app (SolidCraft), driven only through this kit — [full video with narration](https://youtu.be/olbPBROgM3w). ／ このキットだけでAIエージェントがCADを操作し、蝶番をモデリングしている様子（[ナレーション付き動画](https://youtu.be/olbPBROgM3w)）*
 
-## Getting started — 導入はこちら
+> **English summary** — Agent Hands Kit is an open-source (MIT) toolkit that gives AI agents hands and eyes on a real Windows PC: a resident desktop agent driven by UI Automation (snapshots, screenshots, clicks, paste/typing input), PowerShell tools, headless wrappers for Blender / Inkscape / GIMP / FreeCAD / KiCad / LTspice, a VOICEVOX speech harness, and file-mailbox patterns for delegating work between AIs. Localhost-only with token auth. Setup guide: [SETUP.md](SETUP.md) (English, with Japanese summaries).
+
+ ## Getting started — 導入はこちら
 
 **New here? Start with the [Setup Guide (SETUP.md)](SETUP.md).** It covers three ways to install, from easiest to most manual:
 
