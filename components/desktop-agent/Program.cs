@@ -157,6 +157,70 @@ internal static class Program
                 req["action"] = "focus";
                 req["window"] = p.Pos(0);
                 break;
+            case "pixel":
+                req["action"] = "pixel";
+                req["x"] = int.Parse(p.Pos(0));
+                req["y"] = int.Parse(p.Pos(1));
+                break;
+            case "histogram":
+            {
+                req["action"] = "histogram";
+                if (p.Flag("window") is string hw2) req["window"] = hw2;
+                if (p.Flag("rect") is string hr)
+                {
+                    var parts = hr.Split(',').Select(int.Parse).ToArray();
+                    if (parts.Length != 4) throw new InvalidOperationException("--rect needs x,y,w,h");
+                    req["rect"] = new JsonArray(parts[0], parts[1], parts[2], parts[3]);
+                }
+                req["top"] = p.FlagInt("top", 8);
+                break;
+            }
+            case "find-image":
+            {
+                req["action"] = "find-image";
+                string tplPath = p.Flag("file") ?? throw new InvalidOperationException("find-image needs --file <template.png>");
+                req["templateBase64"] = Convert.ToBase64String(File.ReadAllBytes(tplPath));
+                if (p.Flag("region") is string fr)
+                {
+                    var parts = fr.Split(',').Select(int.Parse).ToArray();
+                    if (parts.Length != 4) throw new InvalidOperationException("--region needs x,y,w,h");
+                    req["rect"] = new JsonArray(parts[0], parts[1], parts[2], parts[3]);
+                }
+                if (p.Flag("window") is string fw) req["window"] = fw;
+                if (p.Flag("threshold") is string th) req["threshold"] = double.Parse(th, System.Globalization.CultureInfo.InvariantCulture);
+                break;
+            }
+            case "find-text":
+            {
+                req["action"] = "find-text";
+                req["text"] = p.Rest(0);
+                if (p.Flag("region") is string tr)
+                {
+                    var parts = tr.Split(',').Select(int.Parse).ToArray();
+                    if (parts.Length != 4) throw new InvalidOperationException("--region needs x,y,w,h");
+                    req["rect"] = new JsonArray(parts[0], parts[1], parts[2], parts[3]);
+                }
+                if (p.Flag("window") is string tw2) req["window"] = tw2;
+                if (p.Flag("lang") is string lg) req["lang"] = lg;
+                break;
+            }
+            case "lease":
+            {
+                string sub = p.Pos(0).ToLowerInvariant();
+                if (sub == "acquire")
+                {
+                    req["action"] = "lease-acquire";
+                    req["ttl"] = p.FlagInt("ttl", 300);
+                }
+                else if (sub == "release")
+                {
+                    req["action"] = "lease-release";
+                    req["force"] = p.Switch("force");
+                }
+                else if (sub == "status") req["action"] = "lease-status";
+                else throw new InvalidOperationException("lease needs 'acquire', 'release' or 'status'");
+                break;
+            }
             case "click":
             case "double_click":
             case "right_click":
@@ -177,6 +241,12 @@ internal static class Program
                     var img = (p.Flag("img") ?? throw new InvalidOperationException("--ixy needs --img WxH")).Split('x').Select(int.Parse).ToArray();
                     req["ix"] = parts[0]; req["iy"] = parts[1];
                     req["imgW"] = img[0]; req["imgH"] = img[1];
+                }
+                else if (p.Flag("anchor") is string anch && p.Flag("rel") is string rel)
+                {
+                    var parts = rel.Split(',').Select(int.Parse).ToArray();
+                    if (parts.Length != 2) throw new InvalidOperationException("--rel needs dx,dy");
+                    req["anchorWindow"] = anch; req["relX"] = parts[0]; req["relY"] = parts[1];
                 }
                 else req["element"] = p.Pos(0);
                 break;
@@ -248,6 +318,8 @@ internal static class Program
                 req["action"] = "sequence";
                 string json = p.Flag("file") is string sf ? File.ReadAllText(sf) : p.Rest(0);
                 req["steps"] = JsonNode.Parse(json) ?? throw new InvalidOperationException("sequence: invalid JSON steps");
+                if (p.Switch("dry-run")) req["dryRun"] = true;
+                if (p.Switch("no-receipt")) req["receipt"] = false;
                 break;
             }
             case "setvalue":
@@ -281,6 +353,13 @@ internal static class Program
                 return 1;
         }
 
+        // Global options for every command: --hwnd binds input to a window
+        // (the server refuses when it is not in front), --owner names this
+        // client for the focus lease (or set DESKTOP_AGENT_OWNER).
+        if (p.Flag("hwnd") is string hwndFlag) req["hwnd"] = long.Parse(hwndFlag);
+        string? ownerFlag = p.Flag("owner") ?? Environment.GetEnvironmentVariable("DESKTOP_AGENT_OWNER");
+        if (ownerFlag != null) req["owner"] = ownerFlag;
+
         string raw = await SendAsync(req);
         // Pretty-print the server JSON for humans/agents reading stdout.
         try
@@ -305,6 +384,16 @@ internal static class Program
         Usage: desktop-agent <command> [args]     (server: desktop-agent serve)
 
           ping | status | idle | monitors | windows
+          pixel x y                                      color of one screen point (#RRGGBB)
+          histogram [--rect x,y,w,h | --window w] [--top n]
+                     dominant colors of a region (cheap fill/state verification)
+          find-image --file <template.png> [--region x,y,w,h | --window w] [--threshold 0.85]
+                     locate a UI element by its picture (for apps with shallow UIA)
+          find-text <text> [--region x,y,w,h | --window w] [--lang ja-JP]
+                     locate visible text via Windows OCR
+          lease acquire [--ttl sec] | lease release [--force] | lease status
+                     exclusive GUI lease: while held, other owners' input is refused.
+                     Input also auto-holds a 20s lease per owner.
           screenshot [--window <hwnd|title>] [--rect x,y,w,h] [--out <path>]
                      [--format png|jpg] [--quality n] [--scale 0.5]
           snapshot [window] [--depth n] [--max n] [--region x,y,w,h] [--diff] [--full]
@@ -312,6 +401,7 @@ internal static class Program
                      --diff returns only added/changed/removed vs the previous snapshot.
           focus <hwnd|title>
           click <elementId> | click --xy x,y [--button left|right|middle] [--count n]
+          click --anchor <hwnd|title> --rel dx,dy        window-relative (negative = from right/bottom edge)
           double_click <elementId|--xy x,y>
           right_click  <elementId|--xy x,y>
           drag x1 y1 x2 y2 [--button b]
@@ -322,9 +412,16 @@ internal static class Program
           key <chord>                                    e.g. ctrl+s, alt+tab, win+r
           keydown <key> | keyup <key>                    key = name, vk:0x41, or scan:0x1E
           hold <key> <ms>                                precise key hold (server-side timer)
-          raw <json events> | raw --file f.json          raw SendInput events
-          sequence <json steps> | sequence --file f.json timed batch executed server-side;
+          raw <json events> | raw --file f.json          raw SendInput events;
+                     mouse events accept pixel "x"/"y" as well as normalized "dx"/"dy"
+          sequence <json steps> | sequence --file f.json [--dry-run] [--no-receipt]
+                     timed batch executed server-side;
                      step = {"do":"hold","key":"w","ms":800,"delay":100}
+                     conditions (precond/expect) accept pixel / regionDominant keys;
+                     {"do":"checkpoint","pixel":[x,y,"#RRGGBB",tol]} verifies state,
+                     {"do":"checkpoint","regionChanged":[x,y,w,h]} verifies change
+                     vs the sequence start; a receipt crop of the touched area is
+                     attached to the result. --dry-run traces geometry, presses nothing.
           setvalue <elementId> <text...>
           scrollintoview <elementId>
           launch <app> [--args "..."]
@@ -334,6 +431,9 @@ internal static class Program
         All commands print JSON. Coordinates are physical pixels (see `monitors`).
         Element IDs are stable across snapshots of the same window while the
         element's identity is unchanged.
+        Global options: --hwnd <n> binds input to that window (refused when it
+        is not in front; on sequence it also guards every step), --owner <name>
+        identifies this client for the focus lease (env: DESKTOP_AGENT_OWNER).
         """);
     }
 }

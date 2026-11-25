@@ -494,6 +494,19 @@ internal static class DesktopOps
             }
             else if (kind == "mouse")
             {
+                uint mflags = (uint)(o["flags"]?.GetValue<int>() ?? 0);
+                int mdx, mdy;
+                if (o["x"] != null && o["y"] != null)
+                {
+                    // Pixel coordinates: converted to the normalized absolute
+                    // space here, so sequence files can be written in pixels.
+                    (mdx, mdy) = ToAbsolute(o["x"]!.GetValue<int>(), o["y"]!.GetValue<int>());
+                }
+                else
+                {
+                    mdx = o["dx"]?.GetValue<int>() ?? 0;
+                    mdy = o["dy"]?.GetValue<int>() ?? 0;
+                }
                 inputs.Add(new NativeMethods.INPUT
                 {
                     type = NativeMethods.INPUT_MOUSE,
@@ -501,10 +514,10 @@ internal static class DesktopOps
                     {
                         mi = new NativeMethods.MOUSEINPUT
                         {
-                            dx = o["dx"]?.GetValue<int>() ?? 0,
-                            dy = o["dy"]?.GetValue<int>() ?? 0,
+                            dx = mdx,
+                            dy = mdy,
                             mouseData = (uint)(o["data"]?.GetValue<int>() ?? 0),
-                            dwFlags = (uint)(o["flags"]?.GetValue<int>() ?? 0),
+                            dwFlags = mflags,
                             time = 0,
                             dwExtraInfo = UIntPtr.Zero
                         }
@@ -560,6 +573,200 @@ internal static class DesktopOps
         }
         Flush();
     }
+
+    // ---------------------------------------------------------------- pixels & images
+    /// <summary>Capture an arbitrary screen region as a Bitmap (caller disposes).</summary>
+    public static Bitmap CaptureBitmap(int x, int y, int w, int h)
+    {
+        if (w <= 0 || h <= 0) throw new InvalidOperationException($"invalid capture size {w}x{h}");
+        var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(bmp))
+            g.CopyFromScreen(x, y, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+        return bmp;
+    }
+
+    public static (int R, int G, int B) GetPixel(int x, int y)
+    {
+        using var bmp = CaptureBitmap(x, y, 1, 1);
+        var c = bmp.GetPixel(0, 0);
+        return (c.R, c.G, c.B);
+    }
+
+    public static string Hex(int r, int g, int b) => $"#{r:X2}{g:X2}{b:X2}";
+
+    public static (int R, int G, int B) ParseHex(string hex)
+    {
+        string s = hex.Trim().TrimStart('#');
+        if (s.Length != 6) throw new InvalidOperationException($"color must be #RRGGBB, got '{hex}'");
+        return (Convert.ToInt32(s[..2], 16), Convert.ToInt32(s[2..4], 16), Convert.ToInt32(s[4..6], 16));
+    }
+
+    public static bool ColorClose((int R, int G, int B) a, (int R, int G, int B) b, int tol) =>
+        Math.Abs(a.R - b.R) <= tol && Math.Abs(a.G - b.G) <= tol && Math.Abs(a.B - b.B) <= tol;
+
+    /// <summary>Dominant colors of a region: pixels are bucketed 16x16x16 and each
+    /// bucket reports its members' average color. Cheap screen "touch" for agents:
+    /// verify a fill, a state color, a highlight — without a screenshot round trip.</summary>
+    public static List<(string Hex, int Count, double Frac)> ColorHistogram(int x, int y, int w, int h, int top = 8)
+    {
+        using var bmp = CaptureBitmap(x, y, w, h);
+        var buckets = new Dictionary<int, (long SR, long SG, long SB, int N)>();
+        var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            int stride = data.Stride;
+            var buf = new byte[stride * h];
+            System.Runtime.InteropServices.Marshal.Copy(data.Scan0, buf, 0, buf.Length);
+            for (int yy = 0; yy < h; yy++)
+            {
+                int rowOff = yy * stride;
+                for (int xx = 0; xx < w; xx++)
+                {
+                    int i = rowOff + xx * 4;
+                    int b = buf[i], g = buf[i + 1], r = buf[i + 2];
+                    int key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+                    if (buckets.TryGetValue(key, out var v)) buckets[key] = (v.SR + r, v.SG + g, v.SB + b, v.N + 1);
+                    else buckets[key] = (r, g, b, 1);
+                }
+            }
+        }
+        finally { bmp.UnlockBits(data); }
+        double totalPx = (double)w * h;
+        return buckets.Values.OrderByDescending(v => v.N).Take(top)
+            .Select(v => (Hex((int)(v.SR / v.N), (int)(v.SG / v.N), (int)(v.SB / v.N)), v.N, v.N / totalPx))
+            .ToList();
+    }
+
+    /// <summary>Fraction of pixels in a region whose color is within tol of the target.</summary>
+    public static double ColorFraction(int x, int y, int w, int h, (int R, int G, int B) target, int tol)
+    {
+        using var bmp = CaptureBitmap(x, y, w, h);
+        var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        long hit = 0;
+        try
+        {
+            int stride = data.Stride;
+            var buf = new byte[stride * h];
+            System.Runtime.InteropServices.Marshal.Copy(data.Scan0, buf, 0, buf.Length);
+            for (int yy = 0; yy < h; yy++)
+            {
+                int rowOff = yy * stride;
+                for (int xx = 0; xx < w; xx++)
+                {
+                    int i = rowOff + xx * 4;
+                    if (Math.Abs(buf[i] - target.B) <= tol && Math.Abs(buf[i + 1] - target.G) <= tol && Math.Abs(buf[i + 2] - target.R) <= tol) hit++;
+                }
+            }
+        }
+        finally { bmp.UnlockBits(data); }
+        return hit / ((double)w * h);
+    }
+
+    /// <summary>Fraction of pixels that differ between two same-size bitmaps
+    /// by more than tol in any channel. Used by sequence "changed" checkpoints.</summary>
+    public static double DiffFraction(Bitmap a, Bitmap b, int tol = 24)
+    {
+        if (a.Width != b.Width || a.Height != b.Height) return 1.0;
+        int w = a.Width, h = a.Height;
+        long diff = 0;
+        var da = a.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        var db = b.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            var ba = new byte[da.Stride * h]; var bb = new byte[db.Stride * h];
+            System.Runtime.InteropServices.Marshal.Copy(da.Scan0, ba, 0, ba.Length);
+            System.Runtime.InteropServices.Marshal.Copy(db.Scan0, bb, 0, bb.Length);
+            for (int yy = 0; yy < h; yy++)
+            {
+                int oa = yy * da.Stride, ob = yy * db.Stride;
+                for (int xx = 0; xx < w; xx++)
+                {
+                    int ia = oa + xx * 4, ib = ob + xx * 4;
+                    if (Math.Abs(ba[ia] - bb[ib]) > tol || Math.Abs(ba[ia + 1] - bb[ib + 1]) > tol || Math.Abs(ba[ia + 2] - bb[ib + 2]) > tol) diff++;
+                }
+            }
+        }
+        finally { a.UnlockBits(da); b.UnlockBits(db); }
+        return diff / ((double)w * h);
+    }
+
+    public sealed record TemplateMatch(int X, int Y, int W, int H, double Score);
+
+    private static float[] ToGray(Bitmap bmp)
+    {
+        int w = bmp.Width, h = bmp.Height;
+        var gray = new float[w * h];
+        var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            var buf = new byte[data.Stride * h];
+            System.Runtime.InteropServices.Marshal.Copy(data.Scan0, buf, 0, buf.Length);
+            for (int y = 0; y < h; y++)
+            {
+                int rowOff = y * data.Stride;
+                for (int x = 0; x < w; x++)
+                {
+                    int i = rowOff + x * 4;
+                    gray[y * w + x] = 0.114f * buf[i] + 0.587f * buf[i + 1] + 0.299f * buf[i + 2];
+                }
+            }
+        }
+        finally { bmp.UnlockBits(data); }
+        return gray;
+    }
+
+    /// <summary>Find a template image inside a screen region (grayscale SAD,
+    /// coarse-to-fine). Score is 1 - mean abs difference / 255.</summary>
+    public static TemplateMatch? FindTemplate(Bitmap template, int rx, int ry, int rw, int rh, double threshold)
+    {
+        using var region = CaptureBitmap(rx, ry, rw, rh);
+        var rg = ToGray(region);
+        var tg = ToGray(template);
+        int tw = template.Width, th = template.Height;
+        if (tw > rw || th > rh) return null;
+
+        double SadAt(int ox, int oy, int step)
+        {
+            double sad = 0; long n = 0;
+            for (int y = 0; y < th; y += step)
+            {
+                int rRow = (oy + y) * rw, tRow = y * tw;
+                for (int x = 0; x < tw; x += step)
+                {
+                    sad += Math.Abs(rg[rRow + ox + x] - tg[tRow + x]);
+                    n++;
+                }
+            }
+            return n == 0 ? double.MaxValue : sad / n;
+        }
+
+        int coarse = Math.Max(2, Math.Min(tw, th) / 6);
+        double best = double.MaxValue; int bx = -1, by = -1;
+        for (int oy = 0; oy + th <= rh; oy += coarse)
+            for (int ox = 0; ox + tw <= rw; ox += coarse)
+            {
+                double s = SadAt(ox, oy, coarse);
+                if (s < best) { best = s; bx = ox; by = oy; }
+            }
+        if (bx < 0) return null;
+        // Refine at full sampling around the coarse winner.
+        int x0 = Math.Max(0, bx - coarse), x1 = Math.Min(rw - tw, bx + coarse);
+        int y0 = Math.Max(0, by - coarse), y1 = Math.Min(rh - th, by + coarse);
+        best = double.MaxValue;
+        for (int oy = y0; oy <= y1; oy++)
+            for (int ox = x0; ox <= x1; ox++)
+            {
+                double s = SadAt(ox, oy, 1);
+                if (s < best) { best = s; bx = ox; by = oy; }
+            }
+        double score = 1.0 - best / 255.0;
+        if (score < threshold) return null;
+        return new TemplateMatch(rx + bx, ry + by, tw, th, Math.Round(score, 4));
+    }
+
+    /// <summary>Convert physical pixels to the absolute 0..65535 mouse space
+    /// (virtual-desktop aware). Raw events may give x/y pixels instead of dx/dy.</summary>
+    public static (int Nx, int Ny) AbsoluteFromPixel(int x, int y) => ToAbsolute(x, y);
 
     // ---------------------------------------------------------------- launch
     public static int LaunchApp(string app, string? args)

@@ -19,6 +19,70 @@ internal static class Server
     public static string Token { get; private set; } = "";
 
     private static readonly SemaphoreSlim DesktopGate = new(1, 1);
+
+    // ------------------------------------------------------------ focus lease
+    /// <summary>One GUI "driver" at a time: a lease held by one owner blocks
+    /// input actions from other owners until it expires or is released.
+    /// Input actions auto-hold a short lease for their owner, so even clients
+    /// that never call lease-acquire serialize against explicit holders and
+    /// against each other. (Born from a 2026-11-25 collision: two scheduled
+    /// outreach jobs and a manual drawing session drove the same desktop.)</summary>
+    private sealed class LeaseState
+    {
+        public string Owner = "";
+        public DateTime Expires;
+        public bool Explicit;
+    }
+    private static LeaseState? _lease;
+    private static readonly object LeaseLock = new();
+    private static readonly TimeSpan AutoLeaseTtl = TimeSpan.FromSeconds(20);
+
+    private static readonly HashSet<string> InputActions = new(StringComparer.Ordinal)
+    {
+        "click", "drag", "scroll", "move", "path", "key", "keydown", "keyup", "hold",
+        "raw", "sequence", "type", "setvalue", "scrollintoview", "paste", "focus", "launch",
+    };
+    /// <summary>Actions where a --hwnd binding is enforced (focus/launch are
+    /// exempt: changing the foreground is their job).</summary>
+    private static readonly HashSet<string> HwndBindActions = new(StringComparer.Ordinal)
+    {
+        "click", "drag", "scroll", "move", "path", "key", "keydown", "keyup", "hold",
+        "raw", "sequence", "type", "setvalue", "scrollintoview", "paste",
+    };
+
+    private static string CallerOwner(JsonObject req) => Opt(req, "owner") ?? "default";
+
+    private static void LeaseGate(JsonObject req, string action)
+    {
+        if (!InputActions.Contains(action)) return;
+        string owner = CallerOwner(req);
+        lock (LeaseLock)
+        {
+            var now = DateTime.Now;
+            if (_lease != null && _lease.Expires > now && _lease.Owner != owner)
+                throw new InvalidOperationException(
+                    $"desktop is leased by '{_lease.Owner}' for {(int)(_lease.Expires - now).TotalSeconds}s more; input '{action}' from '{owner}' refused (lease-acquire after it expires, or coordinate with the holder)");
+            if (_lease == null || _lease.Owner == owner)
+            {
+                if (_lease?.Explicit == true && _lease.Owner == owner) { /* keep explicit lease as-is */ }
+                else _lease = new LeaseState { Owner = owner, Expires = now + AutoLeaseTtl, Explicit = false };
+            }
+        }
+    }
+
+    private static void HwndBindGate(JsonObject req, string action)
+    {
+        if (!HwndBindActions.Contains(action)) return;
+        if (req["hwnd"] == null) return;
+        long want = req["hwnd"]!.GetValue<long>();
+        long fg = NativeMethods.GetForegroundWindow().ToInt64();
+        if (fg != want)
+        {
+            var (_, _, proc, title) = DesktopOps.ForegroundInfo();
+            throw new InvalidOperationException(
+                $"focus binding: foreground is hwnd {fg} ({proc} \"{title}\"), not the bound hwnd {want}; input '{action}' was NOT sent");
+        }
+    }
     private static Form? _trayForm;
     private static HttpListener? _listener;
     private static volatile bool _running;
@@ -201,6 +265,12 @@ internal static class Server
                 return;
             }
 
+            if (action is not ("ping" or "status" or "idle" or "stop-server" or "lease-acquire" or "lease-release" or "lease-status"))
+            {
+                LeaseGate(req, action);
+                HwndBindGate(req, action);
+            }
+
             JsonNode data;
             if (action is "ping" or "status" or "idle" or "stop-server")
             {
@@ -269,7 +339,7 @@ internal static class Server
                 var (locked, desk) = DesktopOps.GetLockState();
                 return new JsonObject
                 {
-                    ["serverVersion"] = "1.1.0",
+                    ["serverVersion"] = "1.2.0",
                     ["pid"] = Environment.ProcessId,
                     ["sessionId"] = System.Diagnostics.Process.GetCurrentProcess().SessionId,
                     ["user"] = Environment.UserName,
@@ -315,10 +385,123 @@ internal static class Server
     private static bool OptBool(JsonObject req, string key, bool fallback) =>
         req[key] != null ? req[key]!.GetValue<bool>() : fallback;
 
+    /// <summary>Resolve the target region for observe commands:
+    /// "rect" [x,y,w,h] wins, then "window" (selector), else the virtual screen.</summary>
+    private static (int X, int Y, int W, int H) ResolveRegion(JsonObject req)
+    {
+        if (req["rect"] is JsonArray ra)
+            return (ra[0]!.GetValue<int>(), ra[1]!.GetValue<int>(), ra[2]!.GetValue<int>(), ra[3]!.GetValue<int>());
+        if (Opt(req, "window") is string sel)
+        {
+            var win = DesktopOps.ResolveWindow(sel);
+            if (win.Minimized) throw new InvalidOperationException($"window '{win.Title}' is minimized; focus it first");
+            return (win.X, win.Y, win.Width, win.Height);
+        }
+        return DesktopOps.VirtualScreenRect();
+    }
+
     private static JsonNode DispatchDesktop(string action, JsonObject req)
     {
         switch (action)
         {
+            case "lease-acquire":
+            {
+                string owner = CallerOwner(req);
+                int ttl = Math.Clamp(OptInt(req, "ttl", 300), 5, 3600);
+                lock (LeaseLock)
+                {
+                    var now = DateTime.Now;
+                    // An explicit lease held by another owner blocks acquisition.
+                    // An auto-lease (the 20s courtesy hold from a stray input) does
+                    // NOT: a deliberate acquire preempts it — otherwise whoever
+                    // clicked last would lock everyone else out (drill finding,
+                    // 2026-11-26).
+                    if (_lease != null && _lease.Expires > now && _lease.Owner != owner && _lease.Explicit)
+                        return new JsonObject { ["acquired"] = false, ["heldBy"] = _lease.Owner, ["expiresInSec"] = (int)(_lease.Expires - now).TotalSeconds, ["explicit"] = _lease.Explicit };
+                    _lease = new LeaseState { Owner = owner, Expires = now.AddSeconds(ttl), Explicit = true };
+                    return new JsonObject { ["acquired"] = true, ["owner"] = owner, ["ttlSec"] = ttl };
+                }
+            }
+            case "lease-release":
+            {
+                string owner = CallerOwner(req);
+                lock (LeaseLock)
+                {
+                    if (_lease == null) return new JsonObject { ["released"] = false, ["reason"] = "no lease held" };
+                    if (_lease.Owner != owner && !OptBool(req, "force", false))
+                        return new JsonObject { ["released"] = false, ["reason"] = $"lease is held by '{_lease.Owner}'" };
+                    _lease = null;
+                    return new JsonObject { ["released"] = true };
+                }
+            }
+            case "lease-status":
+            {
+                lock (LeaseLock)
+                {
+                    var now = DateTime.Now;
+                    if (_lease == null || _lease.Expires <= now)
+                        return new JsonObject { ["held"] = false };
+                    return new JsonObject
+                    {
+                        ["held"] = true, ["owner"] = _lease.Owner,
+                        ["expiresInSec"] = (int)(_lease.Expires - now).TotalSeconds,
+                        ["explicit"] = _lease.Explicit,
+                    };
+                }
+            }
+            case "pixel":
+            {
+                int px = Req2(req, "x"), py = Req2(req, "y");
+                var (r, g, b) = DesktopOps.GetPixel(px, py);
+                return new JsonObject { ["x"] = px, ["y"] = py, ["r"] = r, ["g"] = g, ["b"] = b, ["hex"] = DesktopOps.Hex(r, g, b) };
+            }
+            case "histogram":
+            {
+                var (hx, hy, hw, hh) = ResolveRegion(req);
+                int top = Math.Clamp(OptInt(req, "top", 8), 1, 32);
+                var arr = new JsonArray();
+                foreach (var (hex, count, frac) in DesktopOps.ColorHistogram(hx, hy, hw, hh, top))
+                    arr.Add(new JsonObject { ["color"] = hex, ["count"] = count, ["frac"] = Math.Round(frac, 4) });
+                return new JsonObject { ["x"] = hx, ["y"] = hy, ["width"] = hw, ["height"] = hh, ["colors"] = arr };
+            }
+            case "find-image":
+            {
+                EnsureUnlocked(action);
+                System.Drawing.Bitmap tpl;
+                if (Opt(req, "templateBase64") is string b64)
+                {
+                    using var ms = new MemoryStream(Convert.FromBase64String(b64));
+                    using var tmp = new System.Drawing.Bitmap(ms);
+                    tpl = new System.Drawing.Bitmap(tmp);
+                }
+                else if (Opt(req, "templatePath") is string tp) tpl = new System.Drawing.Bitmap(tp);
+                else throw new InvalidOperationException("find-image needs 'templateBase64' or 'templatePath'");
+                using (tpl)
+                {
+                    var (fx, fy, fw, fh) = ResolveRegion(req);
+                    double threshold = req["threshold"] != null ? req["threshold"]!.GetValue<double>() : 0.85;
+                    var m = DesktopOps.FindTemplate(tpl, fx, fy, fw, fh, threshold);
+                    if (m == null) return new JsonObject { ["found"] = false, ["threshold"] = threshold };
+                    return new JsonObject
+                    {
+                        ["found"] = true, ["x"] = m.X, ["y"] = m.Y, ["width"] = m.W, ["height"] = m.H,
+                        ["centerX"] = m.X + m.W / 2, ["centerY"] = m.Y + m.H / 2, ["score"] = m.Score,
+                    };
+                }
+            }
+            case "find-text":
+            {
+                EnsureUnlocked(action);
+                var (tx, ty, tw, th) = ResolveRegion(req);
+                using var bmp = DesktopOps.CaptureBitmap(tx, ty, tw, th);
+                var m = OcrOps.FindText(bmp, Req(req, "text"), Opt(req, "lang"));
+                if (m == null) return new JsonObject { ["found"] = false };
+                return new JsonObject
+                {
+                    ["found"] = true, ["x"] = tx + m.X, ["y"] = ty + m.Y, ["width"] = m.W, ["height"] = m.H,
+                    ["centerX"] = tx + m.X + m.W / 2, ["centerY"] = ty + m.Y + m.H / 2, ["line"] = m.Line,
+                };
+            }
             case "monitors":
             {
                 var arr = new JsonArray();
@@ -420,6 +603,18 @@ internal static class Server
                     var r = UiaOps.ClickElement(eid, button, count);
                     return JsonNode.Parse(JsonSerializer.Serialize(r))!;
                 }
+                if (Opt(req, "anchorWindow") is string anchorSel && req["relX"] != null && req["relY"] != null)
+                {
+                    // Anchor-relative: offsets from a window's top-left; negative
+                    // values count back from its right/bottom edge. Survives the
+                    // window (and its internal panels) moving around.
+                    var win = DesktopOps.ResolveWindow(anchorSel);
+                    int relX = Req2(req, "relX"), relY = Req2(req, "relY");
+                    int ax = relX >= 0 ? win.X + relX : win.X + win.Width + relX;
+                    int ay = relY >= 0 ? win.Y + relY : win.Y + win.Height + relY;
+                    DesktopOps.ClickAt(ax, ay, button, count);
+                    return new JsonObject { ["how"] = "anchor-relative", ["x"] = ax, ["y"] = ay, ["anchor"] = win.Title, ["button"] = button, ["count"] = count };
+                }
                 if (req["ix"] != null)
                 {
                     // Image coordinates: the caller points at a spot in an image of
@@ -509,7 +704,11 @@ internal static class Server
             {
                 EnsureUnlocked(action);
                 if (req["steps"] is not JsonArray steps) throw new InvalidOperationException("sequence needs 'steps' array");
-                return RunSequence(steps);
+                bool dryRun = OptBool(req, "dryRun", false);
+                long guardHwnd = req["guardHwnd"] != null ? req["guardHwnd"]!.GetValue<long>()
+                    : req["hwnd"] != null ? req["hwnd"]!.GetValue<long>() : 0;
+                bool receipt = OptBool(req, "receipt", true);
+                return RunSequence(steps, dryRun, guardHwnd, receipt);
             }
             case "type":
             {
@@ -601,6 +800,28 @@ internal static class Server
         {
             if (hwnd == 0 || !UiaOps.ContainsText(new IntPtr(hwnd), un.GetValue<string>())) return false;
         }
+        // "pixel": [x, y, "#RRGGBB", tol?] — the screen point has (about) this color.
+        if (cond["pixel"] is JsonArray pa && pa.Count >= 3)
+        {
+            int px = pa[0]!.GetValue<int>(), py = pa[1]!.GetValue<int>();
+            var want = DesktopOps.ParseHex(pa[2]!.GetValue<string>());
+            int tol = pa.Count >= 4 ? pa[3]!.GetValue<int>() : 16;
+            var got = DesktopOps.GetPixel(px, py);
+            observed += $" pixel({px},{py})={DesktopOps.Hex(got.R, got.G, got.B)} want {pa[2]!.GetValue<string>()}±{tol}";
+            if (!DesktopOps.ColorClose(got, want, tol)) return false;
+        }
+        // "regionDominant": [x, y, w, h, "#RRGGBB", tol?, minFrac?] — at least
+        // minFrac (default 0.5) of the region is (about) this color.
+        if (cond["regionDominant"] is JsonArray ra && ra.Count >= 5)
+        {
+            int rx = ra[0]!.GetValue<int>(), ry = ra[1]!.GetValue<int>(), rw = ra[2]!.GetValue<int>(), rh = ra[3]!.GetValue<int>();
+            var want = DesktopOps.ParseHex(ra[4]!.GetValue<string>());
+            int tol = ra.Count >= 6 ? ra[5]!.GetValue<int>() : 16;
+            double minFrac = ra.Count >= 7 ? ra[6]!.GetValue<double>() : 0.5;
+            double frac = DesktopOps.ColorFraction(rx, ry, rw, rh, want, tol);
+            observed += $" regionFrac({rx},{ry},{rw}x{rh})={frac:F3} want >={minFrac:F2} of {ra[4]!.GetValue<string>()}±{tol}";
+            if (frac < minFrac) return false;
+        }
         return true;
     }
 
@@ -618,17 +839,141 @@ internal static class Server
     private static readonly HashSet<string> StepControlKeys = new(StringComparer.Ordinal)
     {
         "do", "delay", "precond", "expect", "precondTimeoutMs", "expectTimeoutMs",
+        "pixel", "regionDominant", "pixelChanged", "regionChanged",
     };
+
+    private static JsonObject SubRequest(JsonObject stepObj)
+    {
+        var sub = new JsonObject();
+        foreach (var kv in stepObj)
+        {
+            if (StepControlKeys.Contains(kv.Key)) continue;
+            sub[kv.Key] = kv.Value?.DeepClone();
+        }
+        return sub;
+    }
+
+    /// <summary>A {"do":"checkpoint"} step: verify observable state NOW and fail
+    /// the sequence if it does not hold. Accepts the ConditionMet keys
+    /// (process/window/uiaText/pixel/regionDominant) plus, against the baseline
+    /// captured at sequence start: "pixelChanged": [x, y, tol?] and
+    /// "regionChanged": [x, y, w, h, minFrac?].</summary>
+    private static void EvaluateCheckpoint(JsonObject step, System.Drawing.Bitmap? baseline, int vx, int vy)
+    {
+        var cond = new JsonObject();
+        foreach (string k in new[] { "process", "window", "uiaText", "pixel", "regionDominant" })
+            if (step[k] != null) cond[k] = step[k]!.DeepClone();
+        if (cond.Count > 0 && !ConditionMet(cond, out string obs))
+            throw new InvalidOperationException($"checkpoint failed: {obs}");
+        if (step["pixelChanged"] is JsonArray pc && pc.Count >= 2)
+        {
+            if (baseline == null) throw new InvalidOperationException("pixelChanged checkpoint: no baseline captured");
+            int px = pc[0]!.GetValue<int>(), py = pc[1]!.GetValue<int>();
+            int tol = pc.Count >= 3 ? pc[2]!.GetValue<int>() : 24;
+            var before = baseline.GetPixel(px - vx, py - vy);
+            var now = DesktopOps.GetPixel(px, py);
+            if (DesktopOps.ColorClose(now, (before.R, before.G, before.B), tol))
+                throw new InvalidOperationException($"checkpoint failed: pixel({px},{py}) did not change (still {DesktopOps.Hex(now.R, now.G, now.B)})");
+        }
+        if (step["regionChanged"] is JsonArray rc && rc.Count >= 4)
+        {
+            if (baseline == null) throw new InvalidOperationException("regionChanged checkpoint: no baseline captured");
+            int rx = rc[0]!.GetValue<int>(), ry = rc[1]!.GetValue<int>(), rw = rc[2]!.GetValue<int>(), rh = rc[3]!.GetValue<int>();
+            double minFrac = rc.Count >= 5 ? rc[4]!.GetValue<double>() : 0.01;
+            using var cur = DesktopOps.CaptureBitmap(rx, ry, rw, rh);
+            using var baseCrop = baseline.Clone(new System.Drawing.Rectangle(rx - vx, ry - vy, rw, rh), baseline.PixelFormat);
+            double frac = DesktopOps.DiffFraction(baseCrop, cur);
+            if (frac < minFrac)
+                throw new InvalidOperationException($"checkpoint failed: region({rx},{ry},{rw}x{rh}) changed fraction {frac:F4} < {minFrac}");
+        }
+    }
+
+    /// <summary>Dry-run one step: move the cursor along the intended geometry
+    /// but never press a button or a key. Returns a note for the step report.</summary>
+    private static string DryRunStep(JsonObject stepObj, string doAction)
+    {
+        switch (doAction)
+        {
+            case "path":
+                DispatchDesktop("path", SubRequest(stepObj));
+                return "path traced (a path step presses nothing)";
+            case "raw":
+            {
+                if (stepObj["events"] is not JsonArray evs) return "skipped in dry-run (no events)";
+                var kept = new JsonArray();
+                foreach (var node in evs)
+                {
+                    if (node is not JsonObject o) continue;
+                    if (o["kind"]?.GetValue<string>() != "mouse") continue;
+                    uint flags = (uint)(o["flags"]?.GetValue<int>() ?? 0);
+                    // Keep pure moves (MOVE bit set, no button/wheel bits).
+                    if ((flags & 0x0001) != 0 && (flags & 0x19FE) == 0) kept.Add(o.DeepClone());
+                }
+                if (kept.Count > 0) DispatchDesktop("raw", new JsonObject { ["events"] = kept });
+                return $"kept {kept.Count}/{evs.Count} move-only events";
+            }
+            case "click":
+            case "drag":
+            case "scroll":
+            case "move":
+            {
+                if (stepObj["x"] != null && stepObj["y"] != null)
+                {
+                    DesktopOps.MoveMouse(stepObj["x"]!.GetValue<int>(), stepObj["y"]!.GetValue<int>());
+                    return "cursor moved to the target; the press was simulated";
+                }
+                if (doAction == "drag" && stepObj["x1"] != null && stepObj["y1"] != null)
+                {
+                    DesktopOps.MoveMouse(stepObj["x1"]!.GetValue<int>(), stepObj["y1"]!.GetValue<int>());
+                    return "cursor moved to the drag start; the drag was simulated";
+                }
+                return "skipped in dry-run (element target cannot be traced safely)";
+            }
+            case "focus":
+            case "screenshot":
+            case "snapshot":
+            case "pixel":
+            case "histogram":
+            case "windows":
+            case "monitors":
+                DispatchDesktop(doAction, SubRequest(stepObj));
+                return "executed in dry-run (read-only / focus)";
+            default:
+                return "skipped in dry-run";
+        }
+    }
+
+    private static void CollectReceiptPoints(JsonObject stepObj, string doAction, List<(int X, int Y)> pts)
+    {
+        if (doAction == "path" && stepObj["points"] is JsonArray arr)
+        {
+            foreach (var pt in arr)
+                if (pt is JsonArray xy && xy.Count >= 2) pts.Add((xy[0]!.GetValue<int>(), xy[1]!.GetValue<int>()));
+        }
+        else if (doAction == "click" && stepObj["x"] != null && stepObj["y"] != null)
+        {
+            pts.Add((stepObj["x"]!.GetValue<int>(), stepObj["y"]!.GetValue<int>()));
+        }
+        else if (doAction == "drag")
+        {
+            if (stepObj["x1"] != null && stepObj["y1"] != null) pts.Add((stepObj["x1"]!.GetValue<int>(), stepObj["y1"]!.GetValue<int>()));
+            if (stepObj["x2"] != null && stepObj["y2"] != null) pts.Add((stepObj["x2"]!.GetValue<int>(), stepObj["y2"]!.GetValue<int>()));
+        }
+    }
 
     /// <summary>Execute a batch of steps server-side with precise timing.
     /// Each step: {"do":"<action>", ...params of that action..., "delay": ms to wait before the step}.
     /// A step may also carry "precond" (condition object waited on BEFORE the
     /// step runs) and "expect" (condition object waited on AFTER it runs), with
     /// optional "precondTimeoutMs" (default 3000) / "expectTimeoutMs" (default
-    /// 5000). Waiting on observable state replaces fixed sleeps and blind clicks.
-    /// Timing is scheduled on a Stopwatch timeline and the report includes the
-    /// measured start offset of every step so accuracy is auditable.</summary>
-    private static JsonObject RunSequence(JsonArray steps)
+    /// 5000). Conditions understand process/window/uiaText plus pixel and
+    /// regionDominant screen checks. A {"do":"checkpoint", ...} step verifies
+    /// state (including change vs the sequence-start baseline) and aborts the
+    /// sequence when it does not hold.
+    /// Options on the sequence request: "dryRun" (trace geometry, press
+    /// nothing), "guardHwnd" (abort if that window loses the foreground),
+    /// "receipt" (default true: attach a cropped screenshot of the drawn area).</summary>
+    private static JsonObject RunSequence(JsonArray steps, bool dryRun, long guardHwnd, bool wantReceipt)
     {
         var report = new JsonArray();
         var total = System.Diagnostics.Stopwatch.StartNew();
@@ -636,73 +981,118 @@ internal static class Server
         string? failedError = null;
         int failedAt = -1;
 
-        for (int i = 0; i < steps.Count; i++)
+        var (vx, vy, vw, vh) = DesktopOps.VirtualScreenRect();
+        bool needBaseline = steps.Any(s => s is JsonObject o &&
+            o["do"]?.GetValue<string>() == "checkpoint" &&
+            (o.ContainsKey("pixelChanged") || o.ContainsKey("regionChanged")));
+        System.Drawing.Bitmap? baseline = needBaseline ? DesktopOps.CaptureBitmap(vx, vy, vw, vh) : null;
+        var receiptPts = new List<(int X, int Y)>();
+
+        try
         {
-            var stepObj = steps[i] as JsonObject ?? new JsonObject();
-            string doAction = stepObj["do"]?.GetValue<string>() ?? "";
-            int delay = stepObj["delay"]?.GetValue<int>() ?? 0;
-            if (delay > 0) DesktopOps.PreciseWait(delay);
-            double startMs = total.Elapsed.TotalMilliseconds;
-            var stepSw = System.Diagnostics.Stopwatch.StartNew();
-            try
+            for (int i = 0; i < steps.Count; i++)
             {
-                if (doAction is "sequence" or "stop-server" or "ping" or "status")
-                    throw new InvalidOperationException($"action '{doAction}' is not allowed inside a sequence");
-                // Precondition: wait for the desktop to be in the expected
-                // state BEFORE acting, instead of fixed sleeps and blind clicks.
-                if (stepObj["precond"] is JsonObject pre)
+                var stepObj = steps[i] as JsonObject ?? new JsonObject();
+                string doAction = stepObj["do"]?.GetValue<string>() ?? "";
+                int delay = stepObj["delay"]?.GetValue<int>() ?? 0;
+                if (delay > 0) DesktopOps.PreciseWait(delay);
+                double startMs = total.Elapsed.TotalMilliseconds;
+                var stepSw = System.Diagnostics.Stopwatch.StartNew();
+                string? note = null;
+                try
                 {
-                    int preTmo = stepObj["precondTimeoutMs"]?.GetValue<int>() ?? 3000;
-                    if (!WaitForCondition(pre, preTmo, out string preObs))
-                        throw new InvalidOperationException($"precondition not met within {preTmo}ms: {pre.ToJsonString()} (observed: {preObs})");
+                    if (guardHwnd != 0 && NativeMethods.GetForegroundWindow().ToInt64() != guardHwnd)
+                        throw new InvalidOperationException($"foreground stolen: bound hwnd {guardHwnd} is no longer in front; sequence aborted before step {i} ('{doAction}')");
+                    if (doAction is "sequence" or "stop-server" or "ping" or "status")
+                        throw new InvalidOperationException($"action '{doAction}' is not allowed inside a sequence");
+                    if (doAction == "checkpoint")
+                    {
+                        EvaluateCheckpoint(stepObj, baseline, vx, vy);
+                        note = "checkpoint passed";
+                    }
+                    else if (dryRun)
+                    {
+                        note = DryRunStep(stepObj, doAction);
+                    }
+                    else
+                    {
+                        // Precondition: wait for the desktop to be in the expected
+                        // state BEFORE acting, instead of fixed sleeps and blind clicks.
+                        if (stepObj["precond"] is JsonObject pre)
+                        {
+                            int preTmo = stepObj["precondTimeoutMs"]?.GetValue<int>() ?? 3000;
+                            if (!WaitForCondition(pre, preTmo, out string preObs))
+                                throw new InvalidOperationException($"precondition not met within {preTmo}ms: {pre.ToJsonString()} (observed: {preObs})");
+                        }
+                        DispatchDesktop(doAction, SubRequest(stepObj));
+                        // Expectation: the step only counts as done once its observable
+                        // effect actually arrived.
+                        if (stepObj["expect"] is JsonObject exp)
+                        {
+                            int expTmo = stepObj["expectTimeoutMs"]?.GetValue<int>() ?? 5000;
+                            if (!WaitForCondition(exp, expTmo, out string expObs))
+                                throw new InvalidOperationException($"expectation not met within {expTmo}ms: {exp.ToJsonString()} (observed: {expObs})");
+                        }
+                        CollectReceiptPoints(stepObj, doAction, receiptPts);
+                    }
+                    executed++;
                 }
-                var sub = new JsonObject();
-                foreach (var kv in stepObj)
+                catch (Exception ex)
                 {
-                    if (StepControlKeys.Contains(kv.Key)) continue;
-                    sub[kv.Key] = kv.Value?.DeepClone();
+                    failedAt = i;
+                    failedError = ex.Message;
+                    stepSw.Stop();
+                    report.Add(new JsonObject
+                    {
+                        ["i"] = i, ["do"] = doAction, ["startMs"] = Math.Round(startMs, 2),
+                        ["durationMs"] = Math.Round(stepSw.Elapsed.TotalMilliseconds, 2),
+                        ["ok"] = false, ["error"] = ex.Message,
+                    });
+                    break;
                 }
-                DispatchDesktop(doAction, sub);
-                // Expectation: the step only counts as done once its observable
-                // effect actually arrived.
-                if (stepObj["expect"] is JsonObject exp)
-                {
-                    int expTmo = stepObj["expectTimeoutMs"]?.GetValue<int>() ?? 5000;
-                    if (!WaitForCondition(exp, expTmo, out string expObs))
-                        throw new InvalidOperationException($"expectation not met within {expTmo}ms: {exp.ToJsonString()} (observed: {expObs})");
-                }
-                executed++;
-            }
-            catch (Exception ex)
-            {
-                failedAt = i;
-                failedError = ex.Message;
                 stepSw.Stop();
-                report.Add(new JsonObject
+                var entry = new JsonObject
                 {
                     ["i"] = i, ["do"] = doAction, ["startMs"] = Math.Round(startMs, 2),
                     ["durationMs"] = Math.Round(stepSw.Elapsed.TotalMilliseconds, 2),
-                    ["ok"] = false, ["error"] = ex.Message,
-                });
-                break;
+                    ["ok"] = true,
+                };
+                if (note != null) entry["note"] = note;
+                report.Add(entry);
             }
-            stepSw.Stop();
-            report.Add(new JsonObject
-            {
-                ["i"] = i, ["do"] = doAction, ["startMs"] = Math.Round(startMs, 2),
-                ["durationMs"] = Math.Round(stepSw.Elapsed.TotalMilliseconds, 2),
-                ["ok"] = true,
-            });
         }
+        finally { baseline?.Dispose(); }
         total.Stop();
-        Log("sequence", $"steps={steps.Count} executed={executed} totalMs={total.ElapsedMilliseconds:F1}" + (failedError != null ? $" FAILED at {failedAt}: {failedError}" : ""), failedError == null, failedError);
+        Log("sequence", $"steps={steps.Count} executed={executed} totalMs={total.ElapsedMilliseconds:F1}" + (dryRun ? " (dry-run)" : "") + (failedError != null ? $" FAILED at {failedAt}: {failedError}" : ""), failedError == null, failedError);
         var result = new JsonObject
         {
             ["steps"] = report,
             ["executed"] = executed,
             ["totalMs"] = Math.Round(total.Elapsed.TotalMilliseconds, 2),
         };
+        if (dryRun) result["dryRun"] = true;
         if (failedError != null) { result["failedAt"] = failedAt; result["error"] = failedError; }
+        // Receipt: a tight crop around everything the sequence touched, so the
+        // caller can verify the outcome without a full screenshot round trip.
+        if (wantReceipt && !dryRun && receiptPts.Count > 0)
+        {
+            try
+            {
+                int pad = 24;
+                int bx = Math.Max(vx, receiptPts.Min(p => p.X) - pad), by = Math.Max(vy, receiptPts.Min(p => p.Y) - pad);
+                int ex2 = Math.Min(vx + vw, receiptPts.Max(p => p.X) + pad), ey2 = Math.Min(vy + vh, receiptPts.Max(p => p.Y) + pad);
+                if (ex2 - bx >= 4 && ey2 - by >= 4)
+                {
+                    var shot = DesktopOps.CaptureScreenshot(bx, by, ex2 - bx, ey2 - by, null, ShotsDir);
+                    result["receipt"] = new JsonObject
+                    {
+                        ["path"] = shot.Path, ["x"] = bx, ["y"] = by,
+                        ["width"] = ex2 - bx, ["height"] = ey2 - by,
+                    };
+                }
+            }
+            catch { /* a receipt must never fail the sequence */ }
+        }
         return result;
     }
 

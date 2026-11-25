@@ -4,7 +4,8 @@
     <!-- Console subsystem so the CLI client works reliably from SSH/PowerShell/cmd;
          serve mode hides and frees its console immediately at startup. -->
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <!-- Versioned Windows TFM: unlocks WinRT projections (Windows.Media.Ocr for find-text). -->
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <!-- UseWPF pulls in the UIAutomationClient/UIAutomationTypes references; the app itself uses WinForms only. -->
     <UseWPF>true</UseWPF>
@@ -17,7 +18,7 @@
     <SelfContained>false</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <Version>1.0.0</Version>
+    <Version>1.2.0</Version>
     <Description>Desktop GUI automation agent: resident server in the interactive session + CLI client.</Description>
   </PropertyGroup>
 
